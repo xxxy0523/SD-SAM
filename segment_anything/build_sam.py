@@ -1,164 +1,90 @@
-import torch
+# Modified for SD-SAM: explicit configuration and strict pretrained-weight validation.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved. See licenses/SAM_LICENSE.
+
+"""Construct the SD-SAM ViT-B backbone and load complete SAM weights."""
 
 from functools import partial
+import torch
+from torch.nn import functional as F
 
 from .modeling import ImageEncoderViT, MaskDecoder, PromptEncoder, Sam, TwoWayTransformer
-import torch.nn.functional as F
-
-
-def build_sam_vit_h(checkpoint=None):
-    return _build_sam(
-        encoder_embed_dim=1280,
-        encoder_depth=32,
-        encoder_num_heads=16,
-        encoder_global_attn_indexes=[7, 15, 23, 31],
-        checkpoint=checkpoint,
-    )
-
-
-build_sam = build_sam_vit_h
-
-
-def build_sam_vit_l(checkpoint=None):
-    return _build_sam(
-        encoder_embed_dim=1024,
-        encoder_depth=24,
-        encoder_num_heads=16,
-        encoder_global_attn_indexes=[5, 11, 17, 23],
-        checkpoint=checkpoint,
-    )
-
-
-def build_sam_vit_b(checkpoint=None, w=None):
-    return _build_sam(
-        encoder_embed_dim=768,
-        encoder_depth=12,
-        encoder_num_heads=12,
-        encoder_global_attn_indexes=[2, 5, 8, 11],
-        checkpoint=checkpoint,
-        w=w
-    )
-
-
-sam_model_registry = {
-    "default": build_sam_vit_h,
-    "vit_h": build_sam_vit_h,
-    "vit_l": build_sam_vit_l,
-    "vit_b": build_sam_vit_b,
-}
+from dinov3.loadmodel import extract_state_dict, strip_prefixes
 
 
 def load_sam_checkpoint_with_interpolation(sam_model, checkpoint_path):
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    with open(checkpoint_path, "rb") as f:
-        state_dict = torch.load(f, map_location="cpu")
-
-    # 获取模型当前的 state_dict 作为参考
-    model_dict = sam_model.state_dict()
-
-    # 创建一个新的字典用于更新
-    new_state_dict = {}
-
-    for k, v in state_dict.items():
-        if k in model_dict:
-            # 获取模型中该参数的目标形状
-            target_shape = model_dict[k].shape
-
-            # 如果形状匹配，直接使用
-            if v.shape == target_shape:
-                new_state_dict[k] = v
-
-            # 如果是相对位置编码 (rel_pos) 且形状不匹配，进行插值
-            elif "rel_pos" in k:
-                # print(f"Resizing {k}: {v.shape} -> {target_shape}")
-
-                # v 的形状通常是 [2*Win-1, Head_Dim] (例如 [27, 64])
-                # 变为 [1, Head_Dim, 2*Win-1] 以适应 interpolate
-                v_reshaped = v.unsqueeze(0).permute(0, 2, 1)
-
-                # 目标长度 (例如 127 或 23)
-                target_len = target_shape[0]
-
-                # 执行线性插值
-                v_interp = F.interpolate(v_reshaped, size=target_len, mode='linear', align_corners=False)
-
-                # 变回原来的形状 [Target_Len, Head_Dim]
-                v_final = v_interp.permute(0, 2, 1).squeeze(0)
-
-                new_state_dict[k] = v_final
-
-            # 如果是其他参数不匹配（通常不应该发生），忽略它让模型保持随机初始化，或者报错
-            else:
-                print(f"WARNING: Shape mismatch for {k}, skipping. Ckpt: {v.shape}, Model: {target_shape}")
-                continue
+    state = extract_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
+    # Official SAM keys start with image_encoder.*, prompt_encoder.*, mask_decoder.*.
+    state = {key.removeprefix("module.").removeprefix("sam."): value for key, value in state.items()}
+    current = sam_model.state_dict()
+    adapted = {}
+    unexpected = []
+    for key, value in state.items():
+        if key not in current:
+            unexpected.append(key)
+            continue
+        target = current[key]
+        if value.shape == target.shape:
+            adapted[key] = value
+        elif key == "image_encoder.pos_embed" and value.shape[-1] == target.shape[-1]:
+            adapted[key] = F.interpolate(value.permute(0, 3, 1, 2), target.shape[1:3],
+                                         mode="bicubic", align_corners=False).permute(0, 2, 3, 1)
+        elif "rel_pos" in key and value.ndim == 2 and value.shape[1] == target.shape[1]:
+            adapted[key] = F.interpolate(value.t().unsqueeze(0), target.shape[0],
+                                         mode="linear", align_corners=False).squeeze(0).t()
         else:
-            # 如果模型里没有这个 key (比如你删减了层)，就忽略
-            pass
+            raise RuntimeError(f"SAM checkpoint shape mismatch for {key}: {value.shape} vs {target.shape}")
 
-    # 加载处理后的权重，strict=False 允许你的新模块 (SpectralFusion) 保持随机初始化
-    sam_model.load_state_dict(new_state_dict, strict=False)
-    print("Checkpoint loaded successfully with interpolation.")
+    def is_added(key):
+        return (key.startswith("image_encoder.dinomodel.") or
+                any(token in key for token in (".SimpleFusion.", ".layer_adapter.",
+                                               ".attn.fc_q.", ".attn.fc_k.", ".attn.fc_v.")) or
+                key.endswith(".alpha"))
+
+    missing = [key for key in current if key not in adapted and not is_added(key)]
+    if missing or unexpected:
+        raise RuntimeError(f"Incomplete/incompatible SAM checkpoint. Missing: {missing[:8]}; "
+                           f"unexpected: {unexpected[:8]}")
+    sam_model.load_state_dict(adapted, strict=False)
 
 
-# ==========================================
-# 修改你的 _build_sam 函数
-# ==========================================
-def _build_sam(
-        encoder_embed_dim,
-        encoder_depth,
-        encoder_num_heads,
-        encoder_global_attn_indexes,
-        checkpoint=None,
-        w=None
-):
-    prompt_embed_dim = 256
-    image_size = 1024
-    vit_patch_size = 16
-    image_embedding_size = image_size // vit_patch_size
-
-    # 实例化 SAM
+def build_sam_vit_b(*, checkpoint, dino_backbone_ckpt, image_size, shallow_layers,
+                    adapter_bottleneck, fusion_bottleneck, feature_layers, window_size):
+    if image_size % 16:
+        raise ValueError("image_size must be divisible by 16.")
+    prompt_dim = 256
+    grid = image_size // 16
     sam = Sam(
         image_encoder=ImageEncoderViT(
-            depth=encoder_depth,
-            embed_dim=encoder_embed_dim,
-            img_size=image_size,
-            mlp_ratio=4,
-            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
-            num_heads=encoder_num_heads,
-            patch_size=vit_patch_size,
-            qkv_bias=True,
-            use_rel_pos=True,
-            global_attn_indexes=encoder_global_attn_indexes,
-            window_size=0,
-            out_chans=prompt_embed_dim,
-            w=w
+            depth=12, embed_dim=768, img_size=image_size, mlp_ratio=4,
+            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6), num_heads=12,
+            patch_size=16, qkv_bias=True, use_rel_pos=True,
+            global_attn_indexes=(2, 5, 8, 11), window_size=window_size,
+            out_chans=prompt_dim, dino_backbone_ckpt=dino_backbone_ckpt,
+            shallow_layers=shallow_layers, adapter_bottleneck=adapter_bottleneck,
+            fusion_bottleneck=fusion_bottleneck, feature_layers=feature_layers,
         ),
-        prompt_encoder=PromptEncoder(
-            embed_dim=prompt_embed_dim,
-            image_embedding_size=(image_embedding_size, image_embedding_size),
-            input_image_size=(image_size, image_size),
-            mask_in_chans=16,
-        ),
+        prompt_encoder=PromptEncoder(embed_dim=prompt_dim, image_embedding_size=(grid, grid),
+                                     input_image_size=(image_size, image_size), mask_in_chans=16),
         mask_decoder=MaskDecoder(
             num_multimask_outputs=3,
-            transformer=TwoWayTransformer(
-                depth=2,
-                embedding_dim=prompt_embed_dim,
-                mlp_dim=2048,
-                num_heads=8,
-            ),
-            transformer_dim=prompt_embed_dim,
-            iou_head_depth=3,
-            iou_head_hidden_dim=256,
+            transformer=TwoWayTransformer(depth=2, embedding_dim=prompt_dim, mlp_dim=2048, num_heads=8),
+            transformer_dim=prompt_dim, iou_head_depth=3, iou_head_hidden_dim=256,
         ),
-        pixel_mean=[123.675, 116.28, 103.53],
-        pixel_std=[58.395, 57.12, 57.375],
     )
-
-    sam.eval()
-
-    # 使用新的加载函数
     if checkpoint is not None:
         load_sam_checkpoint_with_interpolation(sam, checkpoint)
+    return sam.eval()
 
-    return sam
+
+def build_sam_vit_h(*args, **kwargs):
+    raise ValueError("SD-SAM's layerwise DINO fusion is implemented for SAM ViT-B only.")
+
+
+def build_sam_vit_l(*args, **kwargs):
+    raise ValueError("SD-SAM's layerwise DINO fusion is implemented for SAM ViT-B only.")
+
+
+build_sam = build_sam_vit_b
+sam_model_registry = {"default": build_sam_vit_b, "vit_b": build_sam_vit_b,
+                      "vit_h": build_sam_vit_h, "vit_l": build_sam_vit_l}

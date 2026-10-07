@@ -1,29 +1,14 @@
-# # Copyright (c) Meta Platforms, Inc. and affiliates.
-# # All rights reserved.
-
-# # This source code is licensed under the license found in the
-# # LICENSE file in the root directory of this source tree.
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+# Modified for SD-SAM: frozen DINO fusion, aligned spatial tokens and configurable adapters.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved. Licensed under the SAM license; see THIRD_PARTY_NOTICES.md.
 
 from typing import Optional, Tuple, Type
-
-from .common import *
-from dinov3.loadmodel import load_dinov3_vitb16, CKPT
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
+from torch import nn
+from torch.nn import functional as F
 
-try:
-    from dinov3.loadmodel import load_dinov3_vitb16, CKPT
-
-    HAS_DINO = True
-except ImportError:
-    print("Warning: dinov3 not found. DINO fusion will be disabled.")
-    HAS_DINO = False
+from .common import LayerNorm2d, MLPBlock, SimpleFusion, LayerAdapter
+from dinov3.loadmodel import load_dinov3_vitb16
 
 
 class ImageEncoderViT(nn.Module):
@@ -45,11 +30,22 @@ class ImageEncoderViT(nn.Module):
             rel_pos_zero_init: bool = True,
             window_size: int = 0,
             global_attn_indexes: Tuple[int, ...] = (),
-            w=None
+            *,
+            dino_backbone_ckpt,
+            shallow_layers,
+            adapter_bottleneck,
+            fusion_bottleneck,
+            feature_layers,
     ) -> None:
         super().__init__()
         self.img_size = img_size
-        self.w = w
+        if not 0 <= shallow_layers <= depth:
+            raise ValueError("shallow_layers must be between zero and encoder depth.")
+        if (len(feature_layers) != 4 or list(feature_layers) != sorted(set(feature_layers))
+                or any(i < 0 or i >= depth for i in feature_layers)):
+            raise ValueError("feature_layers must contain four unique ascending zero-based DINO indices.")
+        self.shallow_layers = shallow_layers
+        self.feature_layers = tuple(feature_layers)
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
             stride=(patch_size, patch_size),
@@ -63,10 +59,11 @@ class ImageEncoderViT(nn.Module):
                 torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim)
             )
 
-        if HAS_DINO:
-            self.dinomodel = load_dinov3_vitb16(CKPT).to("cuda")
-        else:
-            self.dinomodel = None
+        self.dinomodel = load_dinov3_vitb16(dino_backbone_ckpt)
+        self.dinomodel.requires_grad_(False)
+        if (self.dinomodel.embed_dim != embed_dim or self.dinomodel.num_heads != num_heads
+                or len(self.dinomodel.blocks) != depth or self.dinomodel.patch_size != patch_size):
+            raise ValueError("SAM and DINO depth, embedding width, head count and patch size must match.")
         self.blocks = nn.ModuleList()
         for i in range(depth):
             block = Block(
@@ -81,7 +78,9 @@ class ImageEncoderViT(nn.Module):
                 window_size=window_size if i not in global_attn_indexes else 0,
                 input_size=(img_size // patch_size, img_size // patch_size),
                 i=i,
-                w=w
+                shallow_layers=shallow_layers,
+                adapter_bottleneck=adapter_bottleneck,
+                fusion_bottleneck=fusion_bottleneck,
             )
             self.blocks.append(block)
 
@@ -103,43 +102,29 @@ class ImageEncoderViT(nn.Module):
             LayerNorm2d(out_chans),
         )
 
-    def forward(self, x: torch.Tensor, return_interm=True) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-        # 1. 获取 DINO 特征
-        if self.dinomodel is not None:
+    def train(self, mode=True):
+        super().train(mode)
+        self.dinomodel.eval()
+        return self
+
+    def forward(self, x: torch.Tensor, return_interm=True):
+        if x.shape[-2:] != (self.img_size, self.img_size):
+            raise ValueError("Input image dimensions must match the configured image_size.")
+        with torch.no_grad():
             dino_data = self.dinomodel(x)
-            all_dino_output = self.dinomodel.get_intermediate_layers(x, n=12, reshape=True)
-            v_norm = dino_data["x_norm_patchtokens"]
-            B, L, C = v_norm.shape
-            v_norm = v_norm.view(B, 64, 64, C).permute(0, 3, 1, 2)
-        else:
-            dino_data = None
-            all_dino_output = [None] * 12
-            v_norm = None
-
+        all_dino_output = dino_data["intermediate_features"]
         x = self.patch_embed(x)
-
         if self.pos_embed is not None:
             x = x + self.pos_embed
-
-        distill_feats = {"student": [], "teacher": []}
-
-        for i, blk in enumerate(self.blocks):
-
-            x = blk(x, dino_data, all_dino_output)
-            if i < self.w:
-                if return_interm:
-                    distill_feats["student"].append(x)
-                    distill_feats["teacher"].append(all_dino_output[i])
-
-        x = self.neck(x.permute(0, 3, 1, 2))
-        if not return_interm:
-            distill_feats = {}
-        dinode = []
-        dinode.append(all_dino_output[2])
-        dinode.append(all_dino_output[5])
-        dinode.append(all_dino_output[8])
-        dinode.append(all_dino_output[11])
-        return x, dinode, distill_feats
+        distill_feats = {"student": [], "teacher": []} if return_interm else {}
+        for i, block in enumerate(self.blocks):
+            x = block(x, dino_data, all_dino_output)
+            if return_interm and i < self.shallow_layers:
+                distill_feats["student"].append(x)
+                distill_feats["teacher"].append(all_dino_output[i])
+        embeddings = self.neck(x.permute(0, 3, 1, 2))
+        prompt_features = [all_dino_output[i] for i in self.feature_layers]
+        return embeddings, prompt_features, distill_feats
 
 
 class Block(nn.Module):
@@ -156,21 +141,24 @@ class Block(nn.Module):
             rel_pos_zero_init: bool = True,
             window_size: int = 0,
             input_size: Optional[Tuple[int, int]] = None,
-            w=None
+            *,
+            shallow_layers,
+            adapter_bottleneck,
+            fusion_bottleneck,
     ) -> None:
         super().__init__()
         self.i = i
-        self.w = w
+        self.w = shallow_layers
         self.use_dino_fusion = (self.i >= self.w)
         self.use_layer_adapter = (self.i < self.w)
 
         if self.use_dino_fusion:
-            self.SimpleFusion = SimpleFusion(sam_dim=dim, dino_dim=dim, i=self.i)
+            self.SimpleFusion = SimpleFusion(sam_dim=dim, dino_dim=dim, bottleneck_dim=fusion_bottleneck)
         else:
             self.SimpleFusion = None
 
         if self.use_layer_adapter:
-            self.layer_adapter = LayerAdapter(dim=dim, bottleneck=64)
+            self.layer_adapter = LayerAdapter(dim=dim, bottleneck=adapter_bottleneck)
             self.alpha = nn.Parameter(torch.zeros(1))
         else:
             self.layer_adapter = None
@@ -197,7 +185,17 @@ class Block(nn.Module):
             H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, self.window_size)
 
-        x = self.attn(x, dino_data)
+        attention_data = dino_data
+        if self.window_size > 0 and self.use_dino_fusion:
+            window_qkv = []
+            for value in dino_data["allqkv"][self.i]:
+                batch, heads, tokens, head_dim = value.shape
+                grid = value.permute(0, 2, 1, 3).reshape(batch, H, W, heads * head_dim)
+                grid, _ = window_partition(grid, self.window_size)
+                window_qkv.append(grid.reshape(-1, self.window_size ** 2, heads, head_dim)
+                                  .permute(0, 2, 1, 3))
+            attention_data = {"allqkv": {self.i: window_qkv}}
+        x = self.attn(x, attention_data)
 
         if self.window_size > 0:
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
@@ -264,41 +262,9 @@ class Attention(nn.Module):
             DINOqkv = dino_data["allqkv"][self.i]
             DINOq, DINOk, DINOv = DINOqkv[0], DINOqkv[1], DINOqkv[2]
 
-            B_d, n_heads_d, N_dino, d_head_d = DINOq.shape
-
-            if B != B_d:
-                windows_per_image = B // B_d
-                DINOq = DINOq.unsqueeze(1).expand(-1, windows_per_image, -1, -1, -1).reshape(B, n_heads_d, N_dino,
-                                                                                             d_head_d)
-                DINOk = DINOk.unsqueeze(1).expand(-1, windows_per_image, -1, -1, -1).reshape(B, n_heads_d, N_dino,
-                                                                                             d_head_d)
-                DINOv = DINOv.unsqueeze(1).expand(-1, windows_per_image, -1, -1, -1).reshape(B, n_heads_d, N_dino,
-                                                                                             d_head_d)
-
-            if n_heads_d != self.num_heads:
-                if n_heads_d < self.num_heads and self.num_heads % n_heads_d == 0:
-                    repeat = self.num_heads // n_heads_d
-                    DINOq = DINOq.repeat(1, repeat, 1, 1)
-                    DINOk = DINOk.repeat(1, repeat, 1, 1)
-                    DINOv = DINOv.repeat(1, repeat, 1, 1)
-                else:
-                    DINOq = DINOq.mean(dim=1, keepdim=True).repeat(1, self.num_heads, 1, 1)
-                    DINOk = DINOk.mean(dim=1, keepdim=True).repeat(1, self.num_heads, 1, 1)
-                    DINOv = DINOv.mean(dim=1, keepdim=True).repeat(1, self.num_heads, 1, 1)
-
-            if N_dino != N_sam:
-                # --- 修复 4D 插值问题 ---
-                q_temp = DINOq.permute(0, 1, 3, 2).reshape(B * self.num_heads, d_head_d, N_dino)
-                q_temp = F.interpolate(q_temp, size=N_sam, mode='linear')
-                DINOq = q_temp.reshape(B, self.num_heads, d_head_d, N_sam).permute(0, 1, 3, 2)
-
-                k_temp = DINOk.permute(0, 1, 3, 2).reshape(B * self.num_heads, d_head_d, N_dino)
-                k_temp = F.interpolate(k_temp, size=N_sam, mode='linear')
-                DINOk = k_temp.reshape(B, self.num_heads, d_head_d, N_sam).permute(0, 1, 3, 2)
-
-                v_temp = DINOv.permute(0, 1, 3, 2).reshape(B * self.num_heads, d_head_d, N_dino)
-                v_temp = F.interpolate(v_temp, size=N_sam, mode='linear')
-                DINOv = v_temp.reshape(B, self.num_heads, d_head_d, N_sam).permute(0, 1, 3, 2)
+            expected = (B, self.num_heads, N_sam, self.head_dim)
+            if any(value.shape != expected for value in (DINOq, DINOk, DINOv)):
+                raise ValueError(f"DINO patch Q/K/V must align with SAM tokens: expected {expected}.")
 
             q_cat = torch.cat([q_sam, DINOq], dim=-1)
             k_cat = torch.cat([k_sam, DINOk], dim=-1)

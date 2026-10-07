@@ -1,3 +1,4 @@
+# Modified for SD-SAM: preserve parameter identities and freeze flags during prompt encoding.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
@@ -89,13 +90,10 @@ class PromptEncoder(nn.Module):
         point_embedding = self.pe_layer.forward_with_coords(points, self.input_image_size)  #B,N+1,256
         point_embedding[labels == -1] = 0.0
 
-        self.not_a_point_embed.weight = torch.nn.Parameter(self.not_a_point_embed.weight.to(point_embedding.dtype), requires_grad=True)  # todo
-        self.point_embeddings[0].weight = torch.nn.Parameter(self.point_embeddings[0].weight.to(point_embedding.dtype), requires_grad=True) #todo
-        self.point_embeddings[1].weight = torch.nn.Parameter(self.point_embeddings[1].weight.to(point_embedding.dtype), requires_grad=True) #todo
-
-        point_embedding[labels == -1] += self.not_a_point_embed.weight 
-        point_embedding[labels == 0] += self.point_embeddings[0].weight
-        point_embedding[labels == 1] += self.point_embeddings[1].weight
+        # Casting a value must not replace a registered Parameter or unfreeze it.
+        point_embedding[labels == -1] += self.not_a_point_embed.weight.to(point_embedding.dtype)
+        point_embedding[labels == 0] += self.point_embeddings[0].weight.to(point_embedding.dtype)
+        point_embedding[labels == 1] += self.point_embeddings[1].weight.to(point_embedding.dtype)
         return point_embedding
 
     def _embed_boxes(self, boxes: torch.Tensor) -> torch.Tensor:

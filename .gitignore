@@ -1,0 +1,28 @@
+# Local datasets, pretrained weights and experiment outputs
+/data/
+/checkpoints/
+/outputs/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.log
+
+# Private working files and original source backup
+/.local_backup/
+/tmp/
+/dist/
+/.idea/
+/.vscode/
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/

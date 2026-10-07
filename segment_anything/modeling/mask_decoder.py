@@ -1,3 +1,4 @@
+# Modified for SD-SAM: validated matched-batch and single-image prompt handling.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
@@ -124,11 +125,20 @@ class MaskDecoder(nn.Module):
         output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
 
-        # Expand per-image data in batch direction to be per-mask
-        # src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
-        src = image_embeddings
+        # Support a matched image/prompt batch, or several prompts for one image.
+        prompt_batch = tokens.shape[0]
+        if image_embeddings.shape[0] == prompt_batch:
+            src = image_embeddings
+        elif image_embeddings.shape[0] == 1:
+            src = image_embeddings.expand(prompt_batch, -1, -1, -1)
+        else:
+            raise ValueError("Image and prompt batch sizes must match, unless there is one image.")
+        if dense_prompt_embeddings.shape[0] != prompt_batch:
+            raise ValueError("Dense and sparse prompt batch sizes must match.")
         src = src + dense_prompt_embeddings
-        pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
+        if image_pe.shape[0] not in (1, prompt_batch):
+            raise ValueError("Positional encoding batch must be one or match the prompts.")
+        pos_src = image_pe.expand(prompt_batch, -1, -1, -1)
         b, c, h, w = src.shape
 
         # Run the transformer

@@ -1,3 +1,4 @@
+# Modified for SD-SAM: explicit fusion shapes and residual LayerAdapter correction.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
@@ -45,28 +46,22 @@ class LayerNorm2d(nn.Module):
         return x
 
 class SimpleFusion(nn.Module):
-    def __init__(self, sam_dim=768, dino_dim=768, bottleneck_dim=64):
-        """
-        Args:
-            bottleneck_dim: 中间压缩维度。
-                            64 是一个很好的平衡点 (参数量约 15万)。
-                            如果显存还不够，可以改为 32 (参数量约 7万)。
-        """
+    def __init__(self, sam_dim, dino_dim, bottleneck_dim):
         super().__init__()
+        self.dino_dim = dino_dim
         self.reducer = nn.Sequential(
-            nn.Linear(sam_dim + dino_dim, bottleneck_dim), # 1536 -> 64
-            nn.GELU(), # 激活函数
-            nn.Linear(bottleneck_dim, sam_dim)             # 64 -> 768
+            nn.Linear(sam_dim + dino_dim, bottleneck_dim),
+            nn.GELU(),
+            nn.Linear(bottleneck_dim, sam_dim),
         )
 
     def forward(self, x_sam, x_dino):
-
-        if x_dino.shape[1] == 768 and x_dino.shape[-1] != 768:
-            x_dino = x_dino.permute(0, 2, 3, 1) 
-        cat_feat = torch.cat([x_sam, x_dino], dim=-1)
-        fused = self.reducer(cat_feat)
-        out = x_sam + fused
-        return out
+        if x_dino.ndim != 4 or x_dino.shape[1] != self.dino_dim:
+            raise ValueError("DINO fusion expects a BCHW feature map.")
+        x_dino = x_dino.permute(0, 2, 3, 1)
+        if x_sam.shape[:3] != x_dino.shape[:3]:
+            raise ValueError("SAM and DINO feature grids must match.")
+        return x_sam + self.reducer(torch.cat((x_sam, x_dino), dim=-1))
 
 
 class LayerAdapter(nn.Module):
@@ -85,7 +80,8 @@ class LayerAdapter(nn.Module):
         nn.init.zeros_(self.adapter[-1].bias)
 
     def forward(self, x):
-        return self.adapter(x)
+        # Zero-initialized residual branch must preserve the pretrained stream.
+        return x + self.adapter(x)
 
 
 class BottleneckAdapter(nn.Module):

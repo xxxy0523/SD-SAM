@@ -1,3 +1,4 @@
+# Modified for SD-SAM: adapted image encoder tuple output.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
@@ -50,7 +51,7 @@ class Sam(nn.Module):
     def forward(self, batched_input: Dict[str, Any], multimask_output: bool) -> List[Dict[str, torch.Tensor]]:
 
         input_images = batched_input.get("image")
-        image_embeddings = self.image_encoder(input_images)
+        image_embeddings, _, _ = self.image_encoder(input_images, return_interm=False)
 
         if "point_coords" in batched_input and batched_input["point_coords"] != None:
             points = (batched_input["point_coords"], batched_input["point_labels"])

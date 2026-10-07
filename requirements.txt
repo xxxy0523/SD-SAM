@@ -1,0 +1,8 @@
+# Install a matching PyTorch/torchvision build for your CPU or CUDA system first.
+# Integration checks used torch 2.8.0 and torchvision 0.23.0.
+torch==2.8.0
+torchvision==0.23.0
+numpy>=1.26,<3
+Pillow>=10,<12
+opencv-python>=4.8,<5
+tqdm>=4.65,<5
